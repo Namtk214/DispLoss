@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+latents/
+results/
+wandb/
+*.log
+*.txt
+.cache/

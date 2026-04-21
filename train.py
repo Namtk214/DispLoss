@@ -29,6 +29,9 @@ from download import find_model
 from transport import create_transport, Sampler
 from diffusers.models import AutoencoderKL
 from train_utils import parse_transport_args
+from zip_dataset import ZipImageFolder, zip_worker_init_fn
+from latent_dataset import LatentDataset
+from fid_eval import evaluate_fid
 import wandb_utils
 
 
@@ -123,6 +126,10 @@ def main(args):
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
     local_batch_size = int(args.global_batch_size // dist.get_world_size())
+    micro_batch_size = args.micro_batch_size
+    assert local_batch_size % micro_batch_size == 0, f"local_batch_size ({local_batch_size}) must be divisible by micro_batch_size ({micro_batch_size})"
+    gradient_accumulation_steps = local_batch_size // micro_batch_size
+    print(f"Using micro_batch_size={micro_batch_size}, gradient_accumulation_steps={gradient_accumulation_steps}")
 
     # Setup an experiment folder:
     if rank == 0:
@@ -137,9 +144,9 @@ def main(args):
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
 
-        entity = os.environ["ENTITY"]
-        project = os.environ["PROJECT"]
         if args.wandb:
+            entity = os.environ["ENTITY"]
+            project = os.environ["PROJECT"]
             wandb_utils.initialize(args, entity, experiment_name, project)
     else:
         logger = create_logger(None)
@@ -177,17 +184,34 @@ def main(args):
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    # Compile model for faster training
+    if args.compile:
+        logger.info("Compiling model with torch.compile...")
+        model = torch.compile(model)
+        vae = torch.compile(vae)
+
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
     # Setup data:
-    transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-    ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    use_latents = args.latent_dir is not None
+    if use_latents:
+        dataset = LatentDataset(args.latent_dir)
+        worker_init_fn = None
+    else:
+        transform = transforms.Compose([
+            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
+        # Support reading from zip file directly
+        if args.data_path.endswith('.zip'):
+            dataset = ZipImageFolder(args.data_path, prefix='ILSVRC/Data/CLS-LOC/train', transform=transform)
+            worker_init_fn = zip_worker_init_fn
+        else:
+            dataset = ImageFolder(args.data_path, transform=transform)
+            worker_init_fn = None
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -197,19 +221,27 @@ def main(args):
     )
     loader = DataLoader(
         dataset,
-        batch_size=local_batch_size,
+        batch_size=micro_batch_size,
         shuffle=False,
         sampler=sampler,
-        num_workers=args.num_workers,
+        num_workers=0 if use_latents else args.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        worker_init_fn=worker_init_fn,
     )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    logger.info(f"Dataset contains {len(dataset):,} samples ({args.latent_dir or args.data_path})")
+    if use_latents:
+        logger.info("Using pre-computed latents (skipping VAE encode)")
 
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
+
+    # Setup mixed precision
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler('cuda', enabled=(amp_dtype == torch.float16))
+    logger.info(f"Using mixed precision with dtype={amp_dtype}")
 
     # Variables for monitoring/logging purposes:
     train_steps = 0
@@ -217,17 +249,16 @@ def main(args):
     running_loss = 0
     start_time = time()
 
-    # Labels to condition the model with (feel free to change):
-    ys = torch.randint(1000, size=(local_batch_size,), device=device)
+    # Labels to condition the model with for visualization (use micro_batch_size):
+    vis_n = min(micro_batch_size, 8)
+    ys = torch.randint(1000, size=(vis_n,), device=device)
     use_cfg = args.cfg_scale > 1.0
-    # Create sampling noise:
-    n = ys.size(0)
-    zs = torch.randn(n, 4, latent_size, latent_size, device=device)
+    zs = torch.randn(vis_n, 4, latent_size, latent_size, device=device)
 
     # Setup classifier-free guidance:
     if use_cfg:
         zs = torch.cat([zs, zs], 0)
-        y_null = torch.tensor([1000] * n, device=device)
+        y_null = torch.tensor([1000] * vis_n, device=device)
         ys = torch.cat([ys, y_null], 0)
         sample_model_kwargs = dict(y=ys, cfg_scale=args.cfg_scale)
         model_fn = ema.forward_with_cfg
@@ -239,22 +270,33 @@ def main(args):
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
+        micro_step = 0
+        opt.zero_grad()
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            if not use_latents:
+                with torch.no_grad():
+                    # Map input images to latent space + normalize latents:
+                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             model_kwargs = dict(y=y, return_act=args.disp)
-            loss_dict = transport.training_losses(model, x, model_kwargs)
-            loss = loss_dict["loss"].mean()
+            with torch.amp.autocast('cuda', dtype=amp_dtype):
+                loss_dict = transport.training_losses(model, x, model_kwargs)
+                loss = loss_dict["loss"].mean() / gradient_accumulation_steps
+            scaler.scale(loss).backward()
+            micro_step += 1
+
+            if micro_step % gradient_accumulation_steps != 0:
+                continue
+
+            # Optimizer step after accumulating gradients
+            scaler.step(opt)
+            scaler.update()
             opt.zero_grad()
-            loss.backward()
-            opt.step()
             update_ema(ema, model.module)
 
             # Log loss values:
-            running_loss += loss.item()
+            running_loss += loss.item() * gradient_accumulation_steps
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -289,6 +331,12 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    # Keep only last 3 checkpoints
+                    existing_ckpts = sorted(glob(f"{checkpoint_dir}/*.pt"))
+                    while len(existing_ckpts) > 3:
+                        old_ckpt = existing_ckpts.pop(0)
+                        os.remove(old_ckpt)
+                        logger.info(f"Removed old checkpoint: {old_ckpt}")
                 dist.barrier()
             
             if train_steps % args.sample_every == 0 and train_steps > 0:
@@ -300,11 +348,32 @@ def main(args):
                 if use_cfg: #remove null samples
                     samples, _ = samples.chunk(2, dim=0)
                 samples = vae.decode(samples / 0.18215).sample
-                out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
-                dist.all_gather_into_tensor(out_samples, samples)
                 if args.wandb:
-                    wandb_utils.log_image(out_samples, train_steps)
+                    wandb_utils.log_image(samples, train_steps)
                 logging.info("Generating EMA samples done.")
+
+            # FID Evaluation
+            if train_steps % args.eval_every == 0 and train_steps > 0:
+                if rank == 0:
+                    logger.info(f"=== FID Evaluation at step {train_steps} ===")
+                    ema.eval()
+                    fid_score = evaluate_fid(
+                        ema_model=ema,
+                        vae=vae,
+                        transport_sampler=transport_sampler,
+                        n_samples=args.num_fid_samples,
+                        latent_size=latent_size,
+                        device=device,
+                        zip_path=args.data_path if args.data_path.endswith('.zip') else "/root/imagenet-object-localization-challenge.zip",
+                        image_size=args.image_size,
+                        num_steps=args.num_sampling_steps,
+                        cfg_scale=args.cfg_scale,
+                        gen_batch_size=16,
+                    )
+                    logger.info(f"=== FID at step {train_steps}: {fid_score:.4f} ===")
+                    if args.wandb:
+                        wandb_utils.log({"fid": fid_score}, step=train_steps)
+                dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -316,7 +385,9 @@ def main(args):
 if __name__ == "__main__":
     # Default args here will train SiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, required=True)
+    parser.add_argument("--data-path", type=str, default="")
+    parser.add_argument("--latent-dir", type=str, default=None,
+                        help="Path to pre-computed latents directory (skips VAE encode)")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
@@ -326,11 +397,21 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--micro-batch-size", type=int, default=16,
+                        help="Micro-batch size per gradient accumulation step")
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     parser.add_argument("--sample-every", type=int, default=10_000)
+    parser.add_argument("--eval-every", type=int, default=25_000,
+                        help="Evaluate FID every N steps")
+    parser.add_argument("--num-fid-samples", type=int, default=4096,
+                        help="Number of samples for FID evaluation")
+    parser.add_argument("--num-sampling-steps", type=int, default=50,
+                        help="Number of ODE sampling steps for FID generation")
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable torch.compile for faster training")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a custom SiT checkpoint")
     parser.add_argument("--disp", action="store_true",
