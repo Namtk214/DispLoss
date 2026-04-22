@@ -331,9 +331,9 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
-                    # Keep only last 3 checkpoints
+                    # Keep only the latest checkpoint
                     existing_ckpts = sorted(glob(f"{checkpoint_dir}/*.pt"))
-                    while len(existing_ckpts) > 3:
+                    while len(existing_ckpts) > 1:
                         old_ckpt = existing_ckpts.pop(0)
                         os.remove(old_ckpt)
                         logger.info(f"Removed old checkpoint: {old_ckpt}")
@@ -372,7 +372,7 @@ def main(args):
                     )
                     logger.info(f"=== FID at step {train_steps}: {fid_score:.4f} ===")
                     if args.wandb:
-                        wandb_utils.log({"fid": fid_score}, step=train_steps)
+                        wandb_utils.log({"fid": fid_score, "fid_step": train_steps})
                 dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
